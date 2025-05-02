@@ -9,16 +9,16 @@ import tiktoken
 import json
 from qdrant_client.http import models
 
-# Initialize clients
+
 client = QdrantClient(host="localhost", port=6333)
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
-# Could upgrade to a better model like:
-# embeddings = HuggingFaceEmbeddings(model_name="thenlper/gte-large")
 
-# Configure Google API
+
+
+
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-# Initialize reranker - this is a key upgrade for the advanced RAG
+
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 def query_rewriter(question):
@@ -38,15 +38,15 @@ def query_rewriter(question):
         return rewritten_question
     except Exception as e:
         print(f"Query rewriting failed: {e}")
-        return question  # Fall back to original question if rewriting fails
+        return question  
 
 def metadata_filter(question):
     """Extract metadata filters from question if present"""
     filters = None
     
-    # Example: handle questions that specify a source
+    
     if "from document" in question.lower() or "in document" in question.lower():
-        # Simple parsing - in production you'd use NLP for this
+        
         for phrase in ["from document", "in document"]:
             if phrase in question.lower():
                 parts = question.lower().split(phrase)
@@ -61,7 +61,7 @@ def metadata_filter(question):
                             )
                         ]
                     )
-                    # Remove the filter part from the question
+                    
                     question = parts[0].strip()
                     break
     
@@ -71,53 +71,53 @@ def advanced_rag(question):
     start_time = time()
     
     try:
-        # Step 1: Query rewriting (one of your advanced features)
+        
         rewritten_question = query_rewriter(question)
         
-        # Step 2: Extract any metadata filters from the question
+        
         clean_question, filters = metadata_filter(rewritten_question)
         
-        # Step 3: Embed the rewritten question
+        
         query_vector = embeddings.embed_query(clean_question)
     except Exception as e:
         print(f"Error in preprocessing: {e}")
-        # Fallback to basic processing
+        
         clean_question = question
         query_vector = embeddings.embed_query(clean_question)
         filters = None
     
-    # Step 4: First-stage retrieval (get more candidates than we need for reranking)
+    
     search_params = {
         "collection_name": "advanced_corpus",
         "query_vector": query_vector,
-        "limit": 10  # Get more results than we need for reranking
+        "limit": 10  
     }
     
-    # Only add filter if it exists
+    
     if filters:
         search_params["filter"] = filters
         
     results = client.search(**search_params)
     
-    # Step 5: Reranking (another advanced feature)
+    
     pairs = [[clean_question, hit.payload["text"]] for hit in results]
     rerank_scores = reranker.predict(pairs)
     
-    # Combine original results with reranking scores and sort
+    
     reranked_results = sorted(
         zip(results, rerank_scores),
         key=lambda x: x[1],
         reverse=True
-    )[:3]  # Keep top 3 after reranking
+    )[:3]  
     
-    # Extract contexts from reranked results
+    
     contexts = [hit[0].payload["text"] for hit in reranked_results]
     sources = [f"[{hit[0].payload.get('title', 'doc')}:{hit[0].id}]" for hit in reranked_results]
     
-    # Step 6: Generate with source citations
+    
     model = genai.GenerativeModel('gemini-1.5-flash')
     
-    # Create a prompt that encourages citing sources
+    
     prompt = f"""Answer the following question using ONLY the provided context.
     Be concise and to the point. Cite your sources using the reference numbers like [1], [2], etc.
     
@@ -128,18 +128,18 @@ def advanced_rag(question):
     
     Answer with citations:"""
     
-    # For debugging - you can remove this when it's working
+    
     print(f"\nPrompt for generation:\n{prompt[:300]}...(truncated)")
     print(f"Using {len(contexts)} context chunks for generation")
     
     response = model.generate_content(prompt)
     answer = response.text
     
-    # Calculate timing
+    
     end_time = time()
     elapsed_time = end_time - start_time
     
-    # Log results
+    
     log_entry = {
         "question": question,
         "rewritten_question": rewritten_question,
