@@ -1,87 +1,90 @@
+import os
 from langchain_community.document_loaders import DirectoryLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-from rank_bm25 import BM25Okapi
-import pickle
+import tiktoken
 
 # Load documents
 loader = DirectoryLoader("data/raw", glob="**/*.txt")
 documents = loader.load()
 
-# Recursive chunking
+# Recursive chunking with overlap for better context retention
 text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-    chunk_size=200, chunk_overlap=50
+    chunk_size=200,  # Smaller chunks as per advanced RAG suggestion
+    chunk_overlap=50  # Overlap to prevent context loss at boundaries
 )
 chunks = text_splitter.split_documents(documents)
 
-texts = [chunk.page_content for chunk in chunks]
-
-# Tokenize documents for BM25 (simple whitespace split)
-tokenized_docs = [doc.split() for doc in texts]  # Split by spaces
-
-# Build BM25 model
-bm25 = BM25Okapi(tokenized_docs)
-
-# Save BM25 model to disk
-with open("bm25_model.pkl", "wb") as f:
-    pickle.dump(bm25, f)
-
-print("BM25 model saved!")
-
+# Extract metadata to store with each chunk
+processed_chunks = []
+for i, chunk in enumerate(chunks):
+    # Extract source document metadata if available, otherwise use default
+    source = chunk.metadata.get("source", "unknown")
+    title = os.path.basename(source) if source != "unknown" else f"document_{i//5}"
+    
+    processed_chunks.append({
+        "id": i,
+        "text": chunk.page_content,
+        "metadata": {
+            "source": source,
+            "title": title,
+            "chunk_id": i
+        }
+    })
 
 # Initialize Qdrant client
 client = QdrantClient("localhost", port=6333)
 
-# Clean up existing collection
+# Clean up existing collection if it exists
 try:
     client.delete_collection("advanced_corpus")
+    print("Deleted existing advanced_corpus collection")
 except Exception as e:
-    print(f"Collection deletion warning: {e}")
+    print(f"Collection doesn't exist yet: {e}")
 
-# Create new collection with hybrid config
-# client.create_collection(
-#     collection_name="advanced_corpus",
-#     vectors_config=models.VectorParams(
-#         size=768,
-#         distance=models.Distance.COSINE,
-#     ),
-#     sparse_vectors_config={
-#         "text": models.SparseVectorParams(
-#             index=models.SparseIndexParams(
-#                 on_disk=False,
-#                 full_scan_threshold=10000
-#             )
-#         )
-#     }
-# )
+# Create a new collection for dense vectors only (we'll handle hybrid search differently)
 client.create_collection(
     collection_name="advanced_corpus",
     vectors_config=models.VectorParams(
-        size=768,
-        distance=models.Distance.COSINE,
-    ),
-    sparse_vectors_config={
-        "bm25": models.SparseVectorParams()  # Name your sparse vector
-    }
+        size=768,  # Size appropriate for your embedding model
+        distance=models.Distance.COSINE
+    )
 )
 
-# Embed and upload
+# Initialize embedding model - use a better embedding model as suggested in the lab
+# You could replace this with thenlper/gte-large or bge-base-en-v1.5 as suggested
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
-texts = [chunk.page_content for chunk in chunks]
+
+# Generate embeddings for all chunks
+texts = [chunk["text"] for chunk in processed_chunks]
 vectors = embeddings.embed_documents(texts)
 
-client.upsert(
-    collection_name="advanced_corpus",
-    points=[
+# Prepare points for Qdrant with metadata
+points = []
+for i, (chunk, vector) in enumerate(zip(processed_chunks, vectors)):
+    points.append(
         models.PointStruct(
-            id=idx,
+            id=chunk["id"],
             vector=vector,
-            payload={"text": text, "source": "wikipedia"}
+            payload={
+                "text": chunk["text"],
+                "source": chunk["metadata"]["source"],
+                "title": chunk["metadata"]["title"],
+                "chunk_id": chunk["metadata"]["chunk_id"]
+            }
         )
-        for idx, (text, vector) in enumerate(zip(texts, vectors))
-    ]
-)
+    )
 
-print("Advanced corpus created successfully!")
+# Batch insert points to Qdrant
+BATCH_SIZE = 100
+for i in range(0, len(points), BATCH_SIZE):
+    batch = points[i:i+BATCH_SIZE]
+    client.upsert(
+        collection_name="advanced_corpus",
+        points=batch
+    )
+    print(f"Inserted batch {i//BATCH_SIZE + 1}/{(len(points)//BATCH_SIZE) + 1}")
+
+print(f"Successfully ingested {len(points)} chunks into advanced_corpus collection!")

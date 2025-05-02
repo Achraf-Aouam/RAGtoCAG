@@ -1,75 +1,160 @@
-# File: /home/your_username/rag-lab/src/query_advanced.py
-
 import os
-
-import pickle
-from rank_bm25 import BM25Okapi
-import numpy as np
 import jsonlines
 from qdrant_client import QdrantClient
-from langchain.embeddings import HuggingFaceEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 import google.generativeai as genai
-from qdrant_client import models
-from sentence_transformers import CrossEncoder  # Reranking
+from sentence_transformers import CrossEncoder
+from time import time
+import tiktoken
+import json
+from qdrant_client.http import models
 
 # Initialize clients
 client = QdrantClient(host="localhost", port=6333)
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
+# Could upgrade to a better model like:
+# embeddings = HuggingFaceEmbeddings(model_name="thenlper/gte-large")
+
+# Configure Google API
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")  # Changed
 
+# Initialize reranker - this is a key upgrade for the advanced RAG
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-with open("bm25_model.pkl", "rb") as f:
-    bm25 = pickle.load(f)
+def query_rewriter(question):
+    """Use Gemini to rewrite the query for better retrieval"""
+    try:
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        prompt = f"""Rewrite the following question to make it more specific and searchable.
+        Keep the rewritten question focused and concise.
+        
+        Original Question: {question}
+        
+        Rewritten Question:"""
+        
+        response = model.generate_content(prompt)
+        rewritten_question = response.text.strip()
+        print(f"Original: {question}\nRewritten: {rewritten_question}")
+        return rewritten_question
+    except Exception as e:
+        print(f"Query rewriting failed: {e}")
+        return question  # Fall back to original question if rewriting fails
+
+def metadata_filter(question):
+    """Extract metadata filters from question if present"""
+    filters = None
+    
+    # Example: handle questions that specify a source
+    if "from document" in question.lower() or "in document" in question.lower():
+        # Simple parsing - in production you'd use NLP for this
+        for phrase in ["from document", "in document"]:
+            if phrase in question.lower():
+                parts = question.lower().split(phrase)
+                if len(parts) > 1:
+                    doc_name = parts[1].strip().split()[0].strip('."\'?!')
+                    from qdrant_client.http import models
+                    filters = models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="title",
+                                match=models.MatchText(text=doc_name)
+                            )
+                        ]
+                    )
+                    # Remove the filter part from the question
+                    question = parts[0].strip()
+                    break
+    
+    return question, filters
 
 def advanced_rag(question):
-    # Generate dense vector
-    dense_vector = embeddings.embed_query(question)
+    start_time = time()
     
-    # Generate BM25 sparse vector (indices = token IDs, values = weights)
-    tokenized_query = question.split()  # Simple tokenization
-    sparse_indices = [hash(token) % 10000 for token in tokenized_query]  # Map tokens to indices
-    sparse_values = [1.0] * len(sparse_indices)  # Example weights (replace with BM25 logic)
+    try:
+        # Step 1: Query rewriting (one of your advanced features)
+        rewritten_question = query_rewriter(question)
+        
+        # Step 2: Extract any metadata filters from the question
+        clean_question, filters = metadata_filter(rewritten_question)
+        
+        # Step 3: Embed the rewritten question
+        query_vector = embeddings.embed_query(clean_question)
+    except Exception as e:
+        print(f"Error in preprocessing: {e}")
+        # Fallback to basic processing
+        clean_question = question
+        query_vector = embeddings.embed_query(clean_question)
+        filters = None
     
-    # Create sparse vector
-    sparse_vector = models.SparseVector(
-        indices=sparse_indices,
-        values=sparse_values
-    )
+    # Step 4: First-stage retrieval (get more candidates than we need for reranking)
+    search_params = {
+        "collection_name": "advanced_corpus",
+        "query_vector": query_vector,
+        "limit": 10  # Get more results than we need for reranking
+    }
     
-    # Hybrid search
-    results = client.search(
-        collection_name="advanced_corpus",
-        query_vector=dense_vector,
-        sparse_vector=sparse_vector,  # Pass directly (no `name` needed here)
-        limit=10
-    )
-    # Rerank with cross-encoder
-    pairs = [[question, hit.payload["text"]] for hit in results]
+    # Only add filter if it exists
+    if filters:
+        search_params["filter"] = filters
+        
+    results = client.search(**search_params)
+    
+    # Step 5: Reranking (another advanced feature)
+    pairs = [[clean_question, hit.payload["text"]] for hit in results]
     rerank_scores = reranker.predict(pairs)
+    
+    # Combine original results with reranking scores and sort
     reranked_results = sorted(
         zip(results, rerank_scores),
-        key=lambda x: x[1], reverse=True
-    )[:3]  # Keep top 3
-
+        key=lambda x: x[1],
+        reverse=True
+    )[:3]  # Keep top 3 after reranking
+    
+    # Extract contexts from reranked results
     contexts = [hit[0].payload["text"] for hit in reranked_results]
-
-    # Generate with Gemini Flash
-    model = genai.GenerativeModel('gemini-1.5-flash')  # Updated model
-    prompt = f"Answer using ONLY the context below. Cite sources like [doc1].\n\nContext:\n{contexts}\n\nQuestion: {question}"
+    sources = [f"[{hit[0].payload.get('title', 'doc')}:{hit[0].id}]" for hit in reranked_results]
+    
+    # Step 6: Generate with source citations
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    # Create a prompt that encourages citing sources
+    prompt = f"""Answer the following question using ONLY the provided context.
+    Be concise and to the point. Cite your sources using the reference numbers like [1], [2], etc.
+    
+    Context:
+    {' '.join([f'[{i+1}] {ctx}' for i, ctx in enumerate(contexts)])}
+    
+    Question: {question}
+    
+    Answer with citations:"""
+    
+    # For debugging - you can remove this when it's working
+    print(f"\nPrompt for generation:\n{prompt[:300]}...(truncated)")
+    print(f"Using {len(contexts)} context chunks for generation")
+    
     response = model.generate_content(prompt)
     answer = response.text
-
-    # Log to JSONL
+    
+    # Calculate timing
+    end_time = time()
+    elapsed_time = end_time - start_time
+    
+    # Log results
+    log_entry = {
+        "question": question,
+        "rewritten_question": rewritten_question,
+        "contexts": contexts,
+        "sources": sources,
+        "answer": answer,
+        "retrieval_time": elapsed_time
+    }
+    
     with jsonlines.open("results_advanced.jsonl", mode="a") as writer:
-        writer.write({
-            "question": question,
-            "contexts": contexts,
-            "answer": answer
-        })
-
-    return answer
+        writer.write(log_entry)
+    
+    return answer, elapsed_time
 
 if __name__ == "__main__":
-    question = input("Enter question: ")
-    print(advanced_rag(question))
+    question = input("Enter your question: ")
+    answer, time_taken = advanced_rag(question)
+    print(f"\nAnswer (took {time_taken:.2f} seconds):\n{answer}")
